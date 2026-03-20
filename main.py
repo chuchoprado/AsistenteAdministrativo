@@ -1,6 +1,5 @@
 import os
 import re
-import io
 import json
 import time
 import base64
@@ -36,7 +35,7 @@ from openpyxl.utils import get_column_letter
 
 
 logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
@@ -61,6 +60,7 @@ def convert_oga_to_wav(oga_path: str, wav_path: str) -> bool:
 def safe_float(value: Any) -> Optional[float]:
     if value is None:
         return None
+
     if isinstance(value, (int, float)):
         return round(float(value), 2)
 
@@ -68,9 +68,15 @@ def safe_float(value: Any) -> Optional[float]:
     if not text:
         return None
 
-    text = text.replace("€", "").replace("EUR", "").replace(" ", "")
-    text = text.replace(".", "").replace(",", ".") if text.count(",") == 1 and text.count(".") >= 1 else text
-    text = text.replace(",", ".") if text.count(",") == 1 and text.count(".") == 0 else text
+    text = text.replace("€", "").replace("EUR", "").replace("Gs.", "").replace("$", "").strip()
+    text = text.replace(" ", "")
+
+    # Caso 1.234,56
+    if text.count(".") >= 1 and text.count(",") == 1:
+        text = text.replace(".", "").replace(",", ".")
+    # Caso 1234,56
+    elif text.count(",") == 1 and text.count(".") == 0:
+        text = text.replace(",", ".")
 
     try:
         return round(float(text), 2)
@@ -115,10 +121,18 @@ def parse_date_to_iso(date_text: Any) -> Optional[str]:
 
 def normalize_estado(value: Any) -> str:
     text = str(value or "").strip().upper()
-    allowed = {"COMPLETA", "VERIFICAR_DATOS", "PENDIENTE_REVISION"}
-    if text in allowed:
-        return text
-    return "PENDIENTE_REVISION"
+    mapping = {
+        "COMPLETA": "COMPLETA",
+        "OK": "COMPLETA",
+        "COMPLETE": "COMPLETA",
+        "VERIFICAR_DATOS": "VERIFICAR_DATOS",
+        "VERIFICAR": "VERIFICAR_DATOS",
+        "REVISAR": "VERIFICAR_DATOS",
+        "PENDIENTE_REVISION": "PENDIENTE_REVISION",
+        "PENDIENTE": "PENDIENTE_REVISION",
+        "NO_PROCESABLE": "PENDIENTE_REVISION",
+    }
+    return mapping.get(text, "PENDIENTE_REVISION")
 
 
 def build_fallback_row(page_num: int, reason: str) -> Dict[str, Any]:
@@ -137,17 +151,32 @@ def build_fallback_row(page_num: int, reason: str) -> Dict[str, Any]:
 
 
 def normalize_row(row: Dict[str, Any], page_num: int) -> Dict[str, Any]:
+    estado_raw = row.get("estado", row.get("status"))
+    total_raw = (
+        row.get("total_eur")
+        if row.get("total_eur") is not None
+        else row.get("total", row.get("importe_total", row.get("monto_total")))
+    )
+
+    fecha_literal = row.get("fecha_literal")
+    if not fecha_literal and row.get("fecha"):
+        fecha_literal = row.get("fecha")
+
+    fecha_iso = row.get("fecha_iso")
+    if not fecha_iso and row.get("fecha"):
+        fecha_iso = row.get("fecha")
+
     normalized = {
-        "numero_factura": None,
-        "pagina": page_num,
-        "fecha_literal": row.get("fecha_literal"),
-        "fecha_iso": parse_date_to_iso(row.get("fecha_iso") or row.get("fecha_literal")),
-        "total_eur": safe_float(row.get("total_eur")),
+        "numero_factura": row.get("numero_factura"),
+        "pagina": row.get("pagina") if row.get("pagina") is not None else page_num,
+        "fecha_literal": fecha_literal,
+        "fecha_iso": parse_date_to_iso(fecha_iso or fecha_literal),
+        "total_eur": safe_float(total_raw),
         "iva_pct": 10,
         "base_eur": None,
         "cuota_eur": None,
-        "estado": normalize_estado(row.get("estado")),
-        "observaciones": str(row.get("observaciones") or "").strip() or "OK",
+        "estado": normalize_estado(estado_raw),
+        "observaciones": str(row.get("observaciones") or row.get("obs") or "OK").strip(),
     }
 
     if normalized["total_eur"] is not None:
@@ -155,14 +184,23 @@ def normalize_row(row: Dict[str, Any], page_num: int) -> Dict[str, Any]:
         cuota = round(normalized["total_eur"] - base, 2)
         normalized["base_eur"] = base
         normalized["cuota_eur"] = cuota
-    else:
-        normalized["base_eur"] = None
-        normalized["cuota_eur"] = None
 
     if not normalized["fecha_iso"] and normalized["estado"] == "COMPLETA":
         normalized["estado"] = "VERIFICAR_DATOS"
+        if normalized["observaciones"] == "OK":
+            normalized["observaciones"] = "Falta fecha confiable"
+
     if normalized["total_eur"] is None and normalized["estado"] == "COMPLETA":
         normalized["estado"] = "VERIFICAR_DATOS"
+        if normalized["observaciones"] == "OK":
+            normalized["observaciones"] = "Falta total confiable"
+
+    if (
+        normalized["fecha_iso"] is None
+        and normalized["total_eur"] is None
+        and normalized["estado"] != "PENDIENTE_REVISION"
+    ):
+        normalized["estado"] = "PENDIENTE_REVISION"
 
     return normalized
 
@@ -178,19 +216,6 @@ def sort_and_renumber_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     for idx, row in enumerate(rows_sorted, start=1):
         row["numero_factura"] = f"Z-{idx}"
     return rows_sorted
-
-
-def autosize_worksheet(ws) -> None:
-    for column_cells in ws.columns:
-        max_length = 0
-        col_letter = column_cells[0].column_letter
-        for cell in column_cells:
-            try:
-                value = "" if cell.value is None else str(cell.value)
-                max_length = max(max_length, len(value))
-            except Exception:
-                pass
-        ws.column_dimensions[col_letter].width = min(max(max_length + 2, 10), 60)
 
 
 def create_invoice_excel(rows: List[Dict[str, Any]]) -> str:
@@ -224,7 +249,7 @@ def create_invoice_excel(rows: List[Dict[str, Any]]) -> str:
         bottom=Side(style="thin", color="BFBFBF"),
     )
 
-    for col_idx, _ in enumerate(headers, start=1):
+    for col_idx in range(1, len(headers) + 1):
         cell = ws.cell(row=1, column=col_idx)
         cell.fill = header_fill
         cell.font = white_font
@@ -291,7 +316,6 @@ def create_invoice_excel(rows: List[Dict[str, Any]]) -> str:
 
     ws.freeze_panes = "A2"
 
-    # Hoja resumen
     summary = wb.create_sheet("Resumen")
     summary.merge_cells("A1:B1")
     summary["A1"] = "Resumen de extracción"
@@ -305,7 +329,8 @@ def create_invoice_excel(rows: List[Dict[str, Any]]) -> str:
     pendientes = sum(1 for r in rows if r.get("estado") == "PENDIENTE_REVISION")
     vacias = sum(1 for r in rows if "vac" in str(r.get("observaciones", "")).lower())
     no_procesables = sum(
-        1 for r in rows
+        1
+        for r in rows
         if any(x in str(r.get("observaciones", "")).lower() for x in ["ilegible", "no procesable", "no factura", "ocr", "error"])
     )
     pct_completas = round((completas / total_paginas) * 100, 2) if total_paginas else 0.0
@@ -566,7 +591,7 @@ class CoachBot:
                 logger.error(f"Error en process_text_message: {e}", exc_info=True)
                 return "⚠️ Ocurrió un error al procesar tu mensaje."
 
-    def pdf_to_page_images(self, pdf_path: str, dpi: int = 200) -> List[str]:
+    def pdf_to_page_images(self, pdf_path: str, dpi: int = 260) -> List[str]:
         doc = fitz.open(pdf_path)
         data_urls: List[str] = []
         zoom = dpi / 72.0
@@ -586,32 +611,56 @@ class CoachBot:
         schema = {
             "type": "object",
             "properties": {
+                "numero_factura": {"type": ["string", "null"]},
                 "pagina": {"type": ["integer", "null"]},
                 "fecha_literal": {"type": ["string", "null"]},
                 "fecha_iso": {"type": ["string", "null"]},
                 "total_eur": {"type": ["number", "null"]},
-                "estado": {"type": "string"},
-                "observaciones": {"type": "string"},
+                "iva_pct": {"type": ["number", "null"]},
+                "base_eur": {"type": ["number", "null"]},
+                "cuota_eur": {"type": ["number", "null"]},
+                "estado": {"type": ["string", "null"]},
+                "observaciones": {"type": ["string", "null"]},
+                "status": {"type": ["string", "null"]},
+                "total": {"type": ["number", "string", "null"]},
+                "importe_total": {"type": ["number", "string", "null"]},
+                "monto_total": {"type": ["number", "string", "null"]},
+                "fecha": {"type": ["string", "null"]},
             },
-            "required": ["pagina", "fecha_literal", "fecha_iso", "total_eur", "estado", "observaciones"],
+            "required": [
+                "numero_factura",
+                "pagina",
+                "fecha_literal",
+                "fecha_iso",
+                "total_eur",
+                "iva_pct",
+                "base_eur",
+                "cuota_eur",
+                "estado",
+                "observaciones",
+            ],
             "additionalProperties": False,
         }
 
         developer_prompt = (
-            "Eres un extractor contable especializado en facturas y tickets fotografiados o escaneados. "
-            "Analiza UNA sola página de factura/ticket enviada como imagen. "
-            "No inventes datos. Si un dato no puede determinarse con seguridad razonable, usa null. "
-            "Busca fecha de emisión y total pagado final. "
-            "Usa estado COMPLETA, VERIFICAR_DATOS o PENDIENTE_REVISION. "
-            "observaciones debe ser breve y útil. "
-            "No devuelvas explicaciones fuera del JSON."
+            "Eres un extractor contable experto en tickets y facturas escaneadas o fotografiadas. "
+            "Analizas UNA sola página como imagen. "
+            "Debes extraer datos reales visibles en esa página. "
+            "Nunca inventes datos. "
+            "Si un valor no puede determinarse con seguridad razonable, usa null. "
+            "Busca especialmente la fecha de emisión y el total final pagado. "
+            "No confundas subtotal con total final. "
+            "Si la página no es procesable, marca estado como PENDIENTE_REVISION. "
+            "Devuelve exclusivamente JSON válido con los campos requeridos."
         )
 
         user_prompt = (
-            f"Analiza la página {page_num}. "
-            "Extrae la fecha de emisión y el total final pagado. "
-            "Si no es una factura o ticket procesable, márcalo como PENDIENTE_REVISION. "
-            "Devuelve datos reales de esta página."
+            f"Analiza la página {page_num} del PDF. "
+            "Extrae fecha de emisión y total final pagado. "
+            "Si hay duda, usa null. "
+            "Si no es procesable, devuelve estado PENDIENTE_REVISION y explica brevemente por qué en observaciones. "
+            "No devuelvas ejemplos ni plantillas vacías. "
+            "Devuelve datos reales visibles en la imagen."
         )
 
         try:
@@ -655,7 +704,18 @@ class CoachBot:
                 return build_fallback_row(page_num, "Respuesta JSON inválida")
 
             parsed["pagina"] = page_num
-            return normalize_row(parsed, page_num)
+            normalized = normalize_row(parsed, page_num)
+
+            # si vino todo vacío, lo forzamos a pendiente
+            if (
+                normalized["fecha_iso"] is None
+                and normalized["total_eur"] is None
+                and normalized["observaciones"] in ("", "OK")
+            ):
+                normalized["estado"] = "PENDIENTE_REVISION"
+                normalized["observaciones"] = "No se pudo extraer fecha ni total con seguridad"
+
+            return normalized
 
         except Exception as e:
             logger.error(f"Error extrayendo página {page_num}: {e}", exc_info=True)
@@ -697,7 +757,7 @@ class CoachBot:
                     logger.info(f"PDF descargado: {pdf_path}")
                     await update.message.reply_text("📄 PDF recibido. Procesando páginas con OCR visual...")
 
-                    page_images = await asyncio.to_thread(self.pdf_to_page_images, pdf_path, 200)
+                    page_images = await asyncio.to_thread(self.pdf_to_page_images, pdf_path, 260)
                     if not page_images:
                         await update.message.reply_text("⚠️ No pude renderizar páginas del PDF.")
                         return
