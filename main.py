@@ -149,32 +149,17 @@ def build_fallback_row(page_num: int, reason: str) -> Dict[str, Any]:
 
 
 def normalize_row(row: Dict[str, Any], page_num: int) -> Dict[str, Any]:
-    estado_raw = row.get("estado", row.get("status"))
-    total_raw = (
-        row.get("total_eur")
-        if row.get("total_eur") is not None
-        else row.get("total", row.get("importe_total", row.get("monto_total")))
-    )
-
-    fecha_literal = row.get("fecha_literal")
-    if not fecha_literal and row.get("fecha"):
-        fecha_literal = row.get("fecha")
-
-    fecha_iso = row.get("fecha_iso")
-    if not fecha_iso and row.get("fecha"):
-        fecha_iso = row.get("fecha")
-
     normalized = {
         "numero_factura": row.get("numero_factura"),
         "pagina": row.get("pagina") if row.get("pagina") is not None else page_num,
-        "fecha_literal": fecha_literal,
-        "fecha_iso": parse_date_to_iso(fecha_iso or fecha_literal),
-        "total_eur": safe_float(total_raw),
+        "fecha_literal": row.get("fecha_literal"),
+        "fecha_iso": parse_date_to_iso(row.get("fecha_iso") or row.get("fecha_literal")),
+        "total_eur": safe_float(row.get("total_eur")),
         "iva_pct": 10,
         "base_eur": None,
         "cuota_eur": None,
-        "estado": normalize_estado(estado_raw),
-        "observaciones": str(row.get("observaciones") or row.get("obs") or "OK").strip(),
+        "estado": normalize_estado(row.get("estado")),
+        "observaciones": str(row.get("observaciones") or "OK").strip(),
     }
 
     if normalized["total_eur"] is not None:
@@ -618,16 +603,10 @@ class CoachBot:
                 "base_eur": {"type": ["number", "null"]},
                 "cuota_eur": {"type": ["number", "null"]},
                 "estado": {
-                    "type": ["string", "null"],
-                    "enum": ["COMPLETA", "VERIFICAR_DATOS", "PENDIENTE_REVISION", None],
+                    "type": "string",
+                    "enum": ["COMPLETA", "VERIFICAR_DATOS", "PENDIENTE_REVISION"],
                 },
-                "observaciones": {"type": ["string", "null"]},
-                "status": {"type": ["string", "null"]},
-                "total": {"type": ["number", "string", "null"]},
-                "importe_total": {"type": ["number", "string", "null"]},
-                "monto_total": {"type": ["number", "string", "null"]},
-                "fecha": {"type": ["string", "null"]},
-                "obs": {"type": ["string", "null"]},
+                "observaciones": {"type": "string"},
             },
             "required": [
                 "numero_factura",
