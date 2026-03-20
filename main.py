@@ -341,7 +341,7 @@ class CoachBot:
             logger.error(f"Error creando thread para {chat_id}: {e}", exc_info=True)
             return None
 
-    async def wait_for_run_completion(self, thread_id: str, run_id: str, timeout: int = 120):
+    async def wait_for_run_completion(self, thread_id: str, run_id: str, timeout: int = 180):
         start_time = time.time()
         while True:
             run_status = await self.client.beta.threads.runs.retrieve(
@@ -501,13 +501,16 @@ class CoachBot:
 
                     logger.info(f"Archivo subido a OpenAI: {uploaded_file.id}")
 
-                    await update.message.reply_text("📄 PDF recibido. Lo estoy analizando...")
+                    await update.message.reply_text("📄 PDF recibido. Extrayendo data...")
 
                     user_prompt = (
-                        f"He subido un archivo PDF llamado '{safe_name}'. "
-                        "Analízalo y responde según su contenido. "
-                        "Si el usuario pide una tabla, resumen estructurado o datos exportables, "
-                        "devuelve JSON válido y limpio."
+                        f"Lee y extrae la información del PDF '{safe_name}'. "
+                        "NO respondas con explicaciones, disculpas, comentarios ni texto adicional. "
+                        "NO digas que no pudiste extraer la información. "
+                        "Debes devolver ÚNICAMENTE JSON válido, limpio y parseable. "
+                        "Si el documento contiene una tabla o registros, devuelve una lista de objetos JSON. "
+                        "Si el documento contiene campos sueltos, devuelve un objeto JSON con claves y valores. "
+                        "No uses markdown. No uses ```json. No agregues texto antes ni después del JSON."
                     )
 
                     await self.client.beta.threads.messages.create(
@@ -525,6 +528,11 @@ class CoachBot:
                     run = await self.client.beta.threads.runs.create(
                         thread_id=thread_id,
                         assistant_id=self.assistant_id,
+                        instructions=(
+                            "Tu única tarea es extraer la data del archivo y devolver SOLO JSON válido. "
+                            "Nunca respondas con texto conversacional, disculpas, advertencias ni explicaciones. "
+                            "La salida será convertida automáticamente a Excel, así que responde únicamente con JSON."
+                        ),
                     )
 
                     await self.wait_for_run_completion(thread_id, run.id, timeout=180)
@@ -539,7 +547,7 @@ class CoachBot:
                     self.save_conversation(chat_id, "user", f"[PDF enviado] {safe_name}")
                     self.save_conversation(chat_id, "assistant", assistant_message)
 
-                    await self.deliver_response(update, context, assistant_message)
+                    await self.deliver_response(update, context, assistant_message, require_json=True)
 
                 finally:
                     self.pending_requests.discard(chat_id)
@@ -581,7 +589,7 @@ class CoachBot:
                 await update.message.reply_text(f'📝 Tu mensaje: "{user_message}"')
 
                 response = await self.process_text_message(update, context, user_message)
-                await self.deliver_response(update, context, response)
+                await self.deliver_response(update, context, response, require_json=False)
 
             except sr.UnknownValueError:
                 await update.message.reply_text("⚠️ No pude entender la nota de voz.")
@@ -652,6 +660,7 @@ class CoachBot:
         update: Update,
         context: ContextTypes.DEFAULT_TYPE,
         response: str,
+        require_json: bool = False,
     ):
         chat_id = update.message.chat.id
         pref = self.user_preferences.get(
@@ -664,14 +673,14 @@ class CoachBot:
                 excel_path = create_excel_from_json(parsed_json)
 
                 await update.message.reply_text(
-                    "📊 Detecté una respuesta JSON válida. Te envío el Excel."
+                    "📊 JSON detectado. Generando Excel..."
                 )
 
                 with open(excel_path, "rb") as f:
                     await update.message.reply_document(
                         document=f,
                         filename=os.path.basename(excel_path),
-                        caption="Aquí tienes el archivo Excel generado desde la respuesta JSON.",
+                        caption="Aquí tienes el archivo Excel generado desde la extracción.",
                     )
 
                 try:
@@ -687,9 +696,15 @@ class CoachBot:
             except Exception as e:
                 logger.error(f"Error generando Excel desde JSON: {e}", exc_info=True)
                 await update.message.reply_text(
-                    "⚠️ Detecté JSON, pero ocurrió un error al generar el Excel."
+                    "⚠️ Se detectó JSON, pero ocurrió un error al generar el Excel."
                 )
                 return
+
+        if require_json:
+            await update.message.reply_text(
+                "⚠️ El asistente no devolvió JSON válido desde el PDF. Revisa que el Assistant tenga habilitado file_search y que sus instrucciones estén orientadas a extracción estructurada."
+            )
+            return
 
         if pref["voice_responses"] and len(response) < 3500:
             voice_note_path = await self.text_to_speech(response, pref["voice_speed"])
@@ -722,7 +737,7 @@ class CoachBot:
             if response is None or not response.strip():
                 raise ValueError("La respuesta del asistente está vacía")
 
-            await self.deliver_response(update, context, response)
+            await self.deliver_response(update, context, response, require_json=False)
 
         except asyncio.TimeoutError:
             logger.error(f"Timeout procesando mensaje de {chat_id}")
