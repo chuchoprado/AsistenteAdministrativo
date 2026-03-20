@@ -62,7 +62,6 @@ class CoachBot:
         # Validar variables de entorno críticas
         required_env_vars = {
             'TELEGRAM_TOKEN': os.getenv('TELEGRAM_TOKEN'),
-            'SPREADSHEET_ID': os.getenv('SPREADSHEET_ID'),
             'ASSISTANT_ID': os.getenv('ASSISTANT_ID'),
             'OPENAI_API_KEY': os.getenv('OPENAI_API_KEY')
         }
@@ -70,7 +69,6 @@ class CoachBot:
         if missing_vars:
             raise EnvironmentError(f"Faltan variables de entorno requeridas: {', '.join(missing_vars)}")
         self.TELEGRAM_TOKEN = required_env_vars['TELEGRAM_TOKEN']
-        self.SPREADSHEET_ID = required_env_vars['SPREADSHEET_ID']
         self.assistant_id = required_env_vars['ASSISTANT_ID']
         self.credentials_path = '/etc/secrets/credentials.json'
 
