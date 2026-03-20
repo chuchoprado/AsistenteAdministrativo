@@ -1,15 +1,19 @@
 import os
 import re
+import io
 import json
 import time
+import base64
 import asyncio
 import sqlite3
 import logging
 import tempfile
 import subprocess
+from datetime import datetime
 from contextlib import closing
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
+import fitz  # PyMuPDF
 from fastapi import FastAPI, Request
 from telegram import Update
 from telegram.constants import ChatAction
@@ -27,6 +31,8 @@ import speech_recognition as sr
 from gtts import gTTS
 from pydub import AudioSegment
 from openpyxl import Workbook
+from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
 
 
 logging.basicConfig(
@@ -52,185 +58,126 @@ def convert_oga_to_wav(oga_path: str, wav_path: str) -> bool:
         return False
 
 
-def strip_code_fences(text: str) -> str:
-    text = text.strip()
-    if text.startswith("```"):
-        text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
-        text = re.sub(r"\s*```$", "", text)
-    return text.strip()
+def safe_float(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return round(float(value), 2)
 
-
-def try_parse_json(text: str) -> Optional[Any]:
-    if not text or not text.strip():
+    text = str(value).strip()
+    if not text:
         return None
 
-    candidates = []
+    text = text.replace("€", "").replace("EUR", "").replace(" ", "")
+    text = text.replace(".", "").replace(",", ".") if text.count(",") == 1 and text.count(".") >= 1 else text
+    text = text.replace(",", ".") if text.count(",") == 1 and text.count(".") == 0 else text
 
-    raw = text.strip()
-    candidates.append(raw)
-    candidates.append(strip_code_fences(raw))
+    try:
+        return round(float(text), 2)
+    except Exception:
+        return None
 
-    fenced_match = re.search(r"```json\s*(.*?)\s*```", raw, flags=re.IGNORECASE | re.DOTALL)
-    if fenced_match:
-        candidates.append(fenced_match.group(1).strip())
 
-    generic_fence_match = re.search(r"```\s*(.*?)\s*```", raw, flags=re.DOTALL)
-    if generic_fence_match:
-        candidates.append(generic_fence_match.group(1).strip())
+def parse_date_to_iso(date_text: Any) -> Optional[str]:
+    if not date_text:
+        return None
 
-    object_match = re.search(r"(\{.*\})", raw, flags=re.DOTALL)
-    if object_match:
-        candidates.append(object_match.group(1).strip())
+    raw = str(date_text).strip()
+    if not raw:
+        return None
 
-    array_match = re.search(r"(\[.*\])", raw, flags=re.DOTALL)
-    if array_match:
-        candidates.append(array_match.group(1).strip())
+    patterns = [
+        "%Y-%m-%d",
+        "%d-%m-%Y",
+        "%d/%m/%Y",
+        "%d.%m.%Y",
+        "%Y/%m/%d",
+        "%d-%m-%y",
+        "%d/%m/%y",
+    ]
 
-    seen = set()
-    for candidate in candidates:
-        candidate = candidate.strip()
-        if not candidate or candidate in seen:
-            continue
-        seen.add(candidate)
+    for fmt in patterns:
         try:
-            return json.loads(candidate)
+            return datetime.strptime(raw, fmt).strftime("%Y-%m-%d")
         except Exception:
-            continue
+            pass
+
+    match = re.search(r"(\d{2})[\/\-.](\d{2})[\/\-.](\d{4})", raw)
+    if match:
+        d, m, y = match.groups()
+        try:
+            return datetime(int(y), int(m), int(d)).strftime("%Y-%m-%d")
+        except Exception:
+            return None
 
     return None
 
 
-def flatten_dict(d: Dict[str, Any], parent_key: str = "", sep: str = ".") -> Dict[str, Any]:
-    items = {}
-    for k, v in d.items():
-        new_key = f"{parent_key}{sep}{k}" if parent_key else str(k)
-        if isinstance(v, dict):
-            items.update(flatten_dict(v, new_key, sep=sep))
-        else:
-            items[new_key] = v
-    return items
+def normalize_estado(value: Any) -> str:
+    text = str(value or "").strip().upper()
+    allowed = {"COMPLETA", "VERIFICAR_DATOS", "PENDIENTE_REVISION"}
+    if text in allowed:
+        return text
+    return "PENDIENTE_REVISION"
 
 
-def is_probably_schema_definition(data: Any) -> bool:
-    """
-    Detecta respuestas JSON que son schema/plantilla y no datos reales.
-    """
-    if not isinstance(data, dict):
-        return False
-
-    schema_keys = {"type", "properties", "schema", "required", "additionalProperties", "items"}
-    data_keys = set(data.keys())
-
-    if data_keys and data_keys.issubset(schema_keys):
-        return True
-
-    if "type" in data and "properties" in data:
-        return True
-
-    return False
-
-
-def is_valid_extraction_payload(data: Any) -> bool:
-    """
-    Acepta solo payloads del tipo:
-    {
-      "rows": [ {...}, {...} ]
-    }
-    """
-    if not isinstance(data, dict):
-        return False
-
-    if is_probably_schema_definition(data):
-        return False
-
-    if "rows" not in data:
-        return False
-
-    rows = data.get("rows")
-    if not isinstance(rows, list):
-        return False
-
-    if len(rows) == 0:
-        return False
-
-    allowed_keys = {
-        "numero_factura",
-        "pagina",
-        "fecha_literal",
-        "fecha_iso",
-        "total_eur",
-        "iva_pct",
-        "base_eur",
-        "cuota_eur",
-        "estado",
-        "observaciones",
+def build_fallback_row(page_num: int, reason: str) -> Dict[str, Any]:
+    return {
+        "numero_factura": None,
+        "pagina": page_num,
+        "fecha_literal": None,
+        "fecha_iso": None,
+        "total_eur": None,
+        "iva_pct": 10,
+        "base_eur": None,
+        "cuota_eur": None,
+        "estado": "PENDIENTE_REVISION",
+        "observaciones": reason[:250] if reason else "No procesable",
     }
 
-    real_row_found = False
 
-    for row in rows:
-        if not isinstance(row, dict):
-            return False
+def normalize_row(row: Dict[str, Any], page_num: int) -> Dict[str, Any]:
+    normalized = {
+        "numero_factura": None,
+        "pagina": page_num,
+        "fecha_literal": row.get("fecha_literal"),
+        "fecha_iso": parse_date_to_iso(row.get("fecha_iso") or row.get("fecha_literal")),
+        "total_eur": safe_float(row.get("total_eur")),
+        "iva_pct": 10,
+        "base_eur": None,
+        "cuota_eur": None,
+        "estado": normalize_estado(row.get("estado")),
+        "observaciones": str(row.get("observaciones") or "").strip() or "OK",
+    }
 
-        if not row:
-            continue
+    if normalized["total_eur"] is not None:
+        base = round(normalized["total_eur"] / 1.10, 2)
+        cuota = round(normalized["total_eur"] - base, 2)
+        normalized["base_eur"] = base
+        normalized["cuota_eur"] = cuota
+    else:
+        normalized["base_eur"] = None
+        normalized["cuota_eur"] = None
 
-        row_keys = set(row.keys())
-        if not row_keys.issubset(allowed_keys):
-            # Si trae campos raros tipo type/properties, no sirve
-            if row_keys & {"type", "properties", "schema", "items"}:
-                return False
+    if not normalized["fecha_iso"] and normalized["estado"] == "COMPLETA":
+        normalized["estado"] = "VERIFICAR_DATOS"
+    if normalized["total_eur"] is None and normalized["estado"] == "COMPLETA":
+        normalized["estado"] = "VERIFICAR_DATOS"
 
-        # Consideramos "real" si trae al menos alguno de los campos esperados con valor útil
-        useful_keys = [
-            "pagina",
-            "fecha_literal",
-            "fecha_iso",
-            "total_eur",
-            "estado",
-            "observaciones",
-        ]
-        for key in useful_keys:
-            if key in row and row[key] not in (None, "", [], {}):
-                real_row_found = True
-                break
-
-    return real_row_found
+    return normalized
 
 
-def json_to_rows(data: Any) -> Tuple[List[str], List[List[Any]], str]:
-    """
-    Convierte SOLO payload válido de extracción a Excel.
-    """
-    if isinstance(data, dict) and isinstance(data.get("rows"), list):
-        rows_data = data["rows"]
+def sort_and_renumber_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def sort_key(item: Dict[str, Any]):
+        date_iso = item.get("fecha_iso")
+        if date_iso:
+            return (0, date_iso, item.get("pagina") or 0)
+        return (1, "9999-99-99", item.get("pagina") or 0)
 
-        headers = [
-            "numero_factura",
-            "pagina",
-            "fecha_literal",
-            "fecha_iso",
-            "total_eur",
-            "iva_pct",
-            "base_eur",
-            "cuota_eur",
-            "estado",
-            "observaciones",
-        ]
-
-        rows = []
-        for item in rows_data:
-            row = []
-            for h in headers:
-                value = item.get(h, "")
-                if value is None:
-                    value = ""
-                row.append(value)
-            rows.append(row)
-
-        return headers, rows, "Facturas"
-
-    raise ValueError("Payload JSON no válido para extracción contable.")
+    rows_sorted = sorted(rows, key=sort_key)
+    for idx, row in enumerate(rows_sorted, start=1):
+        row["numero_factura"] = f"Z-{idx}"
+    return rows_sorted
 
 
 def autosize_worksheet(ws) -> None:
@@ -243,24 +190,165 @@ def autosize_worksheet(ws) -> None:
                 max_length = max(max_length, len(value))
             except Exception:
                 pass
-        ws.column_dimensions[col_letter].width = min(max(max_length + 2, 12), 60)
+        ws.column_dimensions[col_letter].width = min(max(max_length + 2, 10), 60)
 
 
-def create_excel_from_json(data: Any) -> str:
-    headers, rows, sheet_name = json_to_rows(data)
-
+def create_invoice_excel(rows: List[Dict[str, Any]]) -> str:
     wb = Workbook()
     ws = wb.active
-    ws.title = sheet_name[:31]
+    ws.title = "Facturas"
 
+    headers = [
+        "N°Factura",
+        "Página",
+        "Fecha Literal",
+        "Fecha ISO",
+        "Total €",
+        "IVA",
+        "Base €",
+        "Cuota €",
+        "Estado",
+        "Observaciones",
+    ]
     ws.append(headers)
-    for row in rows:
-        ws.append(row)
 
-    autosize_worksheet(ws)
+    header_fill = PatternFill(fill_type="solid", fgColor="1F3864")
+    white_font = Font(color="FFFFFF", bold=True, name="Arial", size=10)
+    bold_font = Font(bold=True)
+    alt_fill = PatternFill(fill_type="solid", fgColor="EBF0FA")
+    total_fill = PatternFill(fill_type="solid", fgColor="D9E1F2")
+    thin_border = Border(
+        left=Side(style="thin", color="BFBFBF"),
+        right=Side(style="thin", color="BFBFBF"),
+        top=Side(style="thin", color="BFBFBF"),
+        bottom=Side(style="thin", color="BFBFBF"),
+    )
+
+    for col_idx, _ in enumerate(headers, start=1):
+        cell = ws.cell(row=1, column=col_idx)
+        cell.fill = header_fill
+        cell.font = white_font
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+        cell.border = thin_border
+
+    ws.row_dimensions[1].height = 30
+
+    for idx, row in enumerate(rows, start=2):
+        ws.append([
+            row.get("numero_factura"),
+            row.get("pagina"),
+            row.get("fecha_literal"),
+            row.get("fecha_iso"),
+            row.get("total_eur"),
+            row.get("iva_pct"),
+            row.get("base_eur"),
+            row.get("cuota_eur"),
+            row.get("estado"),
+            row.get("observaciones"),
+        ])
+
+        fill = alt_fill if idx % 2 == 0 else None
+        for col_idx in range(1, 11):
+            cell = ws.cell(row=idx, column=col_idx)
+            cell.border = thin_border
+            if fill:
+                cell.fill = fill
+
+        estado_cell = ws.cell(row=idx, column=9)
+        estado = str(row.get("estado") or "")
+        if estado == "COMPLETA":
+            estado_cell.fill = PatternFill(fill_type="solid", fgColor="C6EFCE")
+        elif estado == "VERIFICAR_DATOS":
+            estado_cell.fill = PatternFill(fill_type="solid", fgColor="FFEB9C")
+        elif estado == "PENDIENTE_REVISION":
+            estado_cell.fill = PatternFill(fill_type="solid", fgColor="FFC7CE")
+
+        for col in [5, 7, 8]:
+            ws.cell(row=idx, column=col).number_format = '#,##0.00 €'
+            ws.cell(row=idx, column=col).alignment = Alignment(horizontal="right")
+
+        ws.cell(row=idx, column=6).alignment = Alignment(horizontal="center")
+        ws.cell(row=idx, column=10).alignment = Alignment(wrap_text=True, vertical="top")
+
+    total_row = len(rows) + 2
+    ws.cell(row=total_row, column=1).value = "TOTALES"
+    ws.cell(row=total_row, column=1).font = bold_font
+
+    for col in [5, 7, 8]:
+        col_letter = get_column_letter(col)
+        ws.cell(row=total_row, column=col).value = f"=SUM({col_letter}2:{col_letter}{total_row-1})"
+        ws.cell(row=total_row, column=col).number_format = '#,##0.00 €'
+        ws.cell(row=total_row, column=col).font = bold_font
+        ws.cell(row=total_row, column=col).alignment = Alignment(horizontal="right")
+
+    for col in range(1, 11):
+        ws.cell(row=total_row, column=col).fill = total_fill
+        ws.cell(row=total_row, column=col).border = thin_border
+
+    widths = [12, 10, 16, 14, 18, 8, 18, 14, 22, 55]
+    for idx, width in enumerate(widths, start=1):
+        ws.column_dimensions[get_column_letter(idx)].width = width
+
+    ws.freeze_panes = "A2"
+
+    # Hoja resumen
+    summary = wb.create_sheet("Resumen")
+    summary.merge_cells("A1:B1")
+    summary["A1"] = "Resumen de extracción"
+    summary["A1"].fill = header_fill
+    summary["A1"].font = white_font
+    summary["A1"].alignment = Alignment(horizontal="center")
+
+    total_paginas = len(rows)
+    completas = sum(1 for r in rows if r.get("estado") == "COMPLETA")
+    verificar = sum(1 for r in rows if r.get("estado") == "VERIFICAR_DATOS")
+    pendientes = sum(1 for r in rows if r.get("estado") == "PENDIENTE_REVISION")
+    vacias = sum(1 for r in rows if "vac" in str(r.get("observaciones", "")).lower())
+    no_procesables = sum(
+        1 for r in rows
+        if any(x in str(r.get("observaciones", "")).lower() for x in ["ilegible", "no procesable", "no factura", "ocr", "error"])
+    )
+    pct_completas = round((completas / total_paginas) * 100, 2) if total_paginas else 0.0
+
+    if pendientes >= max(2, total_paginas // 2):
+        estado_general = "PROBLEMAS_MULTIPLES"
+        estado_color = "FFC7CE"
+    elif verificar > 0 or pendientes > 0:
+        estado_general = "REQUIERE_REVISION"
+        estado_color = "FFEB9C"
+    else:
+        estado_general = "EXITOSO"
+        estado_color = "C6EFCE"
+
+    summary_rows = [
+        ("Total páginas", total_paginas),
+        ("Completas", completas),
+        ("Verificar", verificar),
+        ("Pendientes", pendientes),
+        ("Vacías", vacias),
+        ("No procesables", no_procesables),
+        ("% Completas", pct_completas),
+        ("Estado general", estado_general),
+    ]
+
+    for idx, (label, value) in enumerate(summary_rows, start=2):
+        summary.cell(row=idx, column=1, value=label)
+        summary.cell(row=idx, column=2, value=value)
+
+        fill = alt_fill if idx % 2 == 0 else None
+        for col in [1, 2]:
+            c = summary.cell(row=idx, column=col)
+            c.border = thin_border
+            if fill:
+                c.fill = fill
+
+    summary.cell(row=9, column=2).fill = PatternFill(fill_type="solid", fgColor=estado_color)
+    summary.column_dimensions["A"].width = 32
+    summary.column_dimensions["B"].width = 22
 
     temp_dir = tempfile.mkdtemp(prefix="bot_excel_")
-    file_path = os.path.join(temp_dir, f"resultado_{int(time.time())}.xlsx")
+    month_year = datetime.now().strftime("%m%Y")
+    file_path = os.path.join(temp_dir, f"Facturas_{month_year}.xlsx")
     wb.save(file_path)
     return file_path
 
@@ -269,7 +357,6 @@ class CoachBot:
     def __init__(self):
         required_env_vars = {
             "TELEGRAM_TOKEN": os.getenv("TELEGRAM_TOKEN"),
-            "ASSISTANT_ID": os.getenv("ASSISTANT_ID"),
             "OPENAI_API_KEY": os.getenv("OPENAI_API_KEY"),
             "WEBHOOK_URL": os.getenv("WEBHOOK_URL"),
         }
@@ -281,8 +368,9 @@ class CoachBot:
             )
 
         self.telegram_token = required_env_vars["TELEGRAM_TOKEN"]
-        self.assistant_id = required_env_vars["ASSISTANT_ID"]
         self.webhook_url = required_env_vars["WEBHOOK_URL"].strip().strip('"').strip("'")
+        self.model = os.getenv("OPENAI_MODEL", "gpt-4.1-mini").strip()
+        self.client = AsyncOpenAI(api_key=required_env_vars["OPENAI_API_KEY"])
 
         if self.webhook_url.startswith("WEBHOOK_URL="):
             self.webhook_url = self.webhook_url.split("=", 1)[1].strip()
@@ -295,10 +383,7 @@ class CoachBot:
                 f"WEBHOOK_URL debe apuntar a /webhook. Valor actual: {self.webhook_url}"
             )
 
-        self.client = AsyncOpenAI(api_key=required_env_vars["OPENAI_API_KEY"])
-
         self.started = False
-        self.user_threads: Dict[int, str] = {}
         self.pending_requests = set()
         self.db_path = "bot_data.db"
         self.user_preferences: Dict[int, Dict[str, Any]] = {}
@@ -344,6 +429,18 @@ class CoachBot:
                     "voice_responses": bool(voice_responses),
                     "voice_speed": voice_speed,
                 }
+
+    def save_conversation(self, chat_id: int, role: str, content: str):
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                INSERT INTO conversations (chat_id, role, content)
+                VALUES (?, ?, ?)
+                """,
+                (chat_id, role, content),
+            )
+            conn.commit()
 
     def save_user_preference(
         self,
@@ -405,104 +502,38 @@ class CoachBot:
             return await self.set_voice_speed(chat_id, text_lower)
         return None
 
-    def save_conversation(self, chat_id: int, role: str, content: str):
-        with closing(sqlite3.connect(self.db_path)) as conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                """
-                INSERT INTO conversations (chat_id, role, content)
-                VALUES (?, ?, ?)
-                """,
-                (chat_id, role, content),
-            )
-            conn.commit()
-
-    async def get_or_create_thread(self, chat_id: int) -> Optional[str]:
-        if chat_id in self.user_threads:
-            return self.user_threads[chat_id]
-
-        try:
-            thread = await self.client.beta.threads.create()
-            self.user_threads[chat_id] = thread.id
-            return thread.id
-        except Exception as e:
-            logger.error(f"Error creando thread para {chat_id}: {e}", exc_info=True)
-            return None
-
-    async def wait_for_run_completion(self, thread_id: str, run_id: str, timeout: int = 180):
-        start_time = time.time()
-        while True:
-            run_status = await self.client.beta.threads.runs.retrieve(
-                thread_id=thread_id,
-                run_id=run_id,
-            )
-
-            if run_status.status == "completed":
-                return run_status
-
-            if run_status.status in {"failed", "cancelled", "expired"}:
-                raise RuntimeError(f"Run terminó con estado: {run_status.status}")
-
-            if run_status.status == "requires_action":
-                raise RuntimeError("El Assistant requiere una acción adicional no implementada.")
-
-            if time.time() - start_time > timeout:
-                raise TimeoutError("La consulta al asistente tardó demasiado.")
-
-            await asyncio.sleep(2)
-
-    async def get_latest_assistant_text(self, thread_id: str, limit: int = 10) -> Optional[str]:
-        messages = await self.client.beta.threads.messages.list(
-            thread_id=thread_id,
-            order="desc",
-            limit=limit,
+    async def call_text_model(self, user_message: str) -> str:
+        response = await self.client.responses.create(
+            model=self.model,
+            input=[
+                {
+                    "role": "developer",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": (
+                                "Responde en español de forma útil y directa. "
+                                "Si el usuario no está pidiendo extraer un PDF, responde normalmente."
+                            ),
+                        }
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": user_message}],
+                },
+            ],
+            text={"format": {"type": "text"}},
         )
 
-        for msg in messages.data:
-            if msg.role != "assistant" or not msg.content:
-                continue
-            for part in msg.content:
-                if getattr(part, "type", None) == "text":
-                    text_value = part.text.value.strip()
-                    if text_value:
-                        return text_value
-        return None
-
-    async def send_message_to_assistant(self, chat_id: int, user_message: str) -> str:
-        if chat_id in self.pending_requests:
-            return "⏳ Ya estoy procesando tu solicitud anterior."
-
-        self.pending_requests.add(chat_id)
+        output_text = getattr(response, "output_text", None)
+        if output_text:
+            return output_text.strip()
 
         try:
-            thread_id = await self.get_or_create_thread(chat_id)
-            if not thread_id:
-                return "❌ No se pudo establecer conexión con el asistente."
-
-            await self.client.beta.threads.messages.create(
-                thread_id=thread_id,
-                role="user",
-                content=user_message,
-            )
-
-            run = await self.client.beta.threads.runs.create(
-                thread_id=thread_id,
-                assistant_id=self.assistant_id,
-            )
-
-            await self.wait_for_run_completion(thread_id, run.id, timeout=120)
-            response = await self.get_latest_assistant_text(thread_id, limit=10)
-
-            if not response:
-                return "⚠️ La respuesta del asistente llegó vacía."
-
-            return response
-
-        except Exception as e:
-            logger.error(f"Error procesando mensaje con Assistant: {e}", exc_info=True)
-            return "⚠️ Ocurrió un error al procesar tu mensaje."
-        finally:
-            self.pending_requests.discard(chat_id)
+            return response.output[0].content[0].text.strip()
+        except Exception:
+            return "⚠️ No obtuve una respuesta válida."
 
     async def process_text_message(
         self,
@@ -524,19 +555,111 @@ class CoachBot:
 
                 await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
 
-                response = await self.send_message_to_assistant(chat_id, user_message)
+                response = await self.call_text_model(user_message)
 
                 self.save_conversation(chat_id, "user", user_message)
                 self.save_conversation(chat_id, "assistant", response)
 
-                if not response.strip():
-                    return "⚠️ No obtuve una respuesta válida del asistente."
-
-                return response
+                return response or "⚠️ No obtuve una respuesta válida."
 
             except Exception as e:
                 logger.error(f"Error en process_text_message: {e}", exc_info=True)
                 return "⚠️ Ocurrió un error al procesar tu mensaje."
+
+    def pdf_to_page_images(self, pdf_path: str, dpi: int = 200) -> List[str]:
+        doc = fitz.open(pdf_path)
+        data_urls: List[str] = []
+        zoom = dpi / 72.0
+        matrix = fitz.Matrix(zoom, zoom)
+
+        for page_index in range(len(doc)):
+            page = doc.load_page(page_index)
+            pix = page.get_pixmap(matrix=matrix, alpha=False)
+            png_bytes = pix.tobytes("png")
+            b64 = base64.b64encode(png_bytes).decode("utf-8")
+            data_urls.append(f"data:image/png;base64,{b64}")
+
+        doc.close()
+        return data_urls
+
+    async def extract_invoice_from_page(self, image_data_url: str, page_num: int) -> Dict[str, Any]:
+        schema = {
+            "type": "object",
+            "properties": {
+                "pagina": {"type": ["integer", "null"]},
+                "fecha_literal": {"type": ["string", "null"]},
+                "fecha_iso": {"type": ["string", "null"]},
+                "total_eur": {"type": ["number", "null"]},
+                "estado": {"type": "string"},
+                "observaciones": {"type": "string"},
+            },
+            "required": ["pagina", "fecha_literal", "fecha_iso", "total_eur", "estado", "observaciones"],
+            "additionalProperties": False,
+        }
+
+        developer_prompt = (
+            "Eres un extractor contable especializado en facturas y tickets fotografiados o escaneados. "
+            "Analiza UNA sola página de factura/ticket enviada como imagen. "
+            "No inventes datos. Si un dato no puede determinarse con seguridad razonable, usa null. "
+            "Busca fecha de emisión y total pagado final. "
+            "Usa estado COMPLETA, VERIFICAR_DATOS o PENDIENTE_REVISION. "
+            "observaciones debe ser breve y útil. "
+            "No devuelvas explicaciones fuera del JSON."
+        )
+
+        user_prompt = (
+            f"Analiza la página {page_num}. "
+            "Extrae la fecha de emisión y el total final pagado. "
+            "Si no es una factura o ticket procesable, márcalo como PENDIENTE_REVISION. "
+            "Devuelve datos reales de esta página."
+        )
+
+        try:
+            response = await self.client.responses.create(
+                model=self.model,
+                input=[
+                    {
+                        "role": "developer",
+                        "content": [{"type": "input_text", "text": developer_prompt}],
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "input_text", "text": user_prompt},
+                            {"type": "input_image", "image_url": image_data_url, "detail": "high"},
+                        ],
+                    },
+                ],
+                text={
+                    "format": {
+                        "type": "json_schema",
+                        "name": "invoice_page_extraction",
+                        "strict": True,
+                        "schema": schema,
+                    }
+                },
+            )
+
+            output_text = getattr(response, "output_text", None)
+            if not output_text:
+                try:
+                    output_text = response.output[0].content[0].text
+                except Exception:
+                    output_text = None
+
+            if not output_text:
+                return build_fallback_row(page_num, "Sin respuesta estructurada del modelo")
+
+            parsed = json.loads(output_text)
+            if not isinstance(parsed, dict):
+                return build_fallback_row(page_num, "Respuesta JSON inválida")
+
+            parsed["pagina"] = page_num
+            return normalize_row(parsed, page_num)
+
+        except Exception as e:
+            logger.error(f"Error extrayendo página {page_num}: {e}", exc_info=True)
+            return build_fallback_row(page_num, f"Error OCR/modelo en página {page_num}")
 
     async def handle_pdf(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         pdf_path = None
@@ -562,91 +685,60 @@ class CoachBot:
                     return
 
                 self.pending_requests.add(chat_id)
+
                 try:
-                    await context.bot.send_chat_action(
-                        chat_id=chat_id, action=ChatAction.UPLOAD_DOCUMENT
-                    )
+                    await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_DOCUMENT)
 
                     tg_file = await document.get_file()
                     safe_name = document.file_name or f"archivo_{chat_id}.pdf"
                     pdf_path = os.path.join(tempfile.gettempdir(), safe_name)
-
                     await tg_file.download_to_drive(pdf_path)
+
                     logger.info(f"PDF descargado: {pdf_path}")
+                    await update.message.reply_text("📄 PDF recibido. Procesando páginas con OCR visual...")
 
-                    thread_id = await self.get_or_create_thread(chat_id)
-                    if not thread_id:
-                        await update.message.reply_text(
-                            "❌ No se pudo crear el thread del asistente."
-                        )
+                    page_images = await asyncio.to_thread(self.pdf_to_page_images, pdf_path, 200)
+                    if not page_images:
+                        await update.message.reply_text("⚠️ No pude renderizar páginas del PDF.")
                         return
 
-                    with open(pdf_path, "rb") as f:
-                        uploaded_file = await self.client.files.create(
-                            file=f,
-                            purpose="assistants",
+                    extracted_rows: List[Dict[str, Any]] = []
+                    total_pages = len(page_images)
+
+                    for idx, image_data_url in enumerate(page_images, start=1):
+                        await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+                        row = await self.extract_invoice_from_page(image_data_url, idx)
+                        extracted_rows.append(row)
+
+                        if idx == 1 or idx == total_pages or idx % 5 == 0:
+                            await update.message.reply_text(f"🔎 Procesadas {idx}/{total_pages} páginas...")
+
+                    extracted_rows = sort_and_renumber_rows(extracted_rows)
+
+                    excel_path = create_invoice_excel(extracted_rows)
+                    with open(excel_path, "rb") as f:
+                        await update.message.reply_document(
+                            document=f,
+                            filename=os.path.basename(excel_path),
+                            caption="Aquí tienes el Excel generado desde la extracción del PDF.",
                         )
 
-                    logger.info(f"Archivo subido a OpenAI: {uploaded_file.id}")
-
-                    await update.message.reply_text("📄 PDF recibido. Extrayendo data...")
-
-                    user_prompt = (
-                        f"Lee y extrae la información del PDF '{safe_name}'. "
-                        "Devuelve únicamente datos reales extraídos del documento. "
-                        "No describas el esquema. "
-                        "No devuelvas type, properties, schema, required, items ni plantillas vacías. "
-                        "No devuelvas ejemplos. "
-                        "No devuelvas texto fuera de la estructura. "
-                        "Debes devolver únicamente un objeto con la clave rows, conteniendo un array de registros reales extraídos del PDF. "
-                        "Nunca inventes datos. Si no puedes determinar un valor con seguridad razonable, usa null."
+                    summary_text = (
+                        f"✅ Proceso completado.\n"
+                        f"Páginas procesadas: {len(extracted_rows)}\n"
+                        f"Completas: {sum(1 for r in extracted_rows if r['estado'] == 'COMPLETA')}\n"
+                        f"Verificar: {sum(1 for r in extracted_rows if r['estado'] == 'VERIFICAR_DATOS')}\n"
+                        f"Pendientes: {sum(1 for r in extracted_rows if r['estado'] == 'PENDIENTE_REVISION')}"
                     )
+                    await update.message.reply_text(summary_text)
 
-                    await self.client.beta.threads.messages.create(
-                        thread_id=thread_id,
-                        role="user",
-                        content=user_prompt,
-                        attachments=[
-                            {
-                                "file_id": uploaded_file.id,
-                                "tools": [{"type": "file_search"}],
-                            }
-                        ],
-                    )
-
-                    run = await self.client.beta.threads.runs.create(
-                        thread_id=thread_id,
-                        assistant_id=self.assistant_id,
-                        instructions=(
-                            "Tu única tarea es extraer data real del PDF y devolver únicamente un objeto JSON con la clave rows. "
-                            "No devuelvas el schema. "
-                            "No devuelvas plantillas vacías. "
-                            "No devuelvas definiciones de formato. "
-                            "No respondas con type, properties, schema, items ni estructuras de ejemplo. "
-                            "Debes devolver datos reales del documento. "
-                            "Si no puedes extraer un valor, usa null. "
-                            "Si una página no es procesable, incluye igualmente un registro real con estado PENDIENTE_REVISION."
-                        ),
-                    )
-
-                    await self.wait_for_run_completion(thread_id, run.id, timeout=180)
-                    assistant_message = await self.get_latest_assistant_text(thread_id, limit=10)
-
-                    if not assistant_message:
-                        await update.message.reply_text(
-                            "⚠️ El asistente no devolvió una respuesta."
-                        )
-                        return
-
-                    self.save_conversation(chat_id, "user", f"[PDF enviado] {safe_name}")
-                    self.save_conversation(chat_id, "assistant", assistant_message)
-
-                    await self.deliver_response(
-                        update,
-                        context,
-                        assistant_message,
-                        require_json=True,
-                    )
+                    try:
+                        os.remove(excel_path)
+                        parent_dir = os.path.dirname(excel_path)
+                        if os.path.isdir(parent_dir):
+                            os.rmdir(parent_dir)
+                    except Exception:
+                        pass
 
                 finally:
                     self.pending_requests.discard(chat_id)
@@ -688,15 +780,13 @@ class CoachBot:
                 await update.message.reply_text(f'📝 Tu mensaje: "{user_message}"')
 
                 response = await self.process_text_message(update, context, user_message)
-                await self.deliver_response(update, context, response, require_json=False)
+                await self.deliver_text_response(update, context, response)
 
             except sr.UnknownValueError:
                 await update.message.reply_text("⚠️ No pude entender la nota de voz.")
             except sr.RequestError as e:
                 logger.error(f"Error en SpeechRecognition: {e}")
-                await update.message.reply_text(
-                    "⚠️ Error en el servicio de reconocimiento de voz."
-                )
+                await update.message.reply_text("⚠️ Error en el servicio de reconocimiento de voz.")
 
         except Exception as e:
             logger.error(f"Error manejando mensaje de voz: {e}", exc_info=True)
@@ -708,155 +798,6 @@ class CoachBot:
                         os.remove(file_path)
                 except Exception as e:
                     logger.error(f"Error eliminando temporal {file_path}: {e}")
-
-    async def voice_settings_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        chat_id = update.message.chat.id
-        pref = self.user_preferences.get(
-            chat_id, {"voice_responses": False, "voice_speed": 1.0}
-        )
-        voice_status = "activadas" if pref["voice_responses"] else "desactivadas"
-
-        help_text = (
-            "🎙 Configuración de voz\n\n"
-            f"Estado actual: respuestas de voz {voice_status}\n"
-            f"Velocidad actual: {pref['voice_speed']}x\n\n"
-            "Comandos:\n"
-            "- Activar voz\n"
-            "- Desactivar voz\n"
-            "- Velocidad 1.2\n"
-        )
-        await update.message.reply_text(help_text)
-
-    async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await update.message.reply_text(
-            "👋 Bienvenido. Envíame texto, voz o un PDF. "
-            "Si el asistente devuelve datos estructurados válidos, te entregaré un Excel."
-        )
-
-    async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        help_text = (
-            "🤖 Comandos disponibles:\n\n"
-            "/start - Iniciar el bot\n"
-            "/help - Mostrar ayuda\n"
-            "/voz - Configurar respuestas por voz\n\n"
-            "Funcionalidades:\n"
-            "- Mensajes de texto\n"
-            "- Notas de voz\n"
-            "- PDFs para analizar\n"
-            "- Generación de Excel cuando el asistente devuelva rows válidos\n"
-        )
-        await update.message.reply_text(help_text)
-
-    async def route_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        try:
-            await self.handle_message(update, context)
-        except Exception as e:
-            logger.error(f"Error en route_message: {e}", exc_info=True)
-            await update.message.reply_text("❌ Ocurrió un error procesando tu mensaje.")
-
-    async def deliver_response(
-        self,
-        update: Update,
-        context: ContextTypes.DEFAULT_TYPE,
-        response: str,
-        require_json: bool = False,
-    ):
-        chat_id = update.message.chat.id
-        pref = self.user_preferences.get(
-            chat_id, {"voice_responses": False, "voice_speed": 1.0}
-        )
-
-        parsed_json = try_parse_json(response)
-
-        if parsed_json is not None:
-            if not is_valid_extraction_payload(parsed_json):
-                logger.warning(f"JSON recibido pero no válido para extracción: {parsed_json}")
-
-                if require_json:
-                    await update.message.reply_text(
-                        "⚠️ El asistente devolvió JSON, pero no contiene datos de extracción válidos."
-                    )
-                    return
-            else:
-                try:
-                    excel_path = create_excel_from_json(parsed_json)
-
-                    await update.message.reply_text("📊 Datos válidos detectados. Generando Excel...")
-
-                    with open(excel_path, "rb") as f:
-                        await update.message.reply_document(
-                            document=f,
-                            filename=os.path.basename(excel_path),
-                            caption="Aquí tienes el archivo Excel generado desde la extracción.",
-                        )
-
-                    try:
-                        os.remove(excel_path)
-                        parent_dir = os.path.dirname(excel_path)
-                        if os.path.isdir(parent_dir):
-                            os.rmdir(parent_dir)
-                    except Exception:
-                        pass
-
-                    return
-
-                except Exception as e:
-                    logger.error(f"Error generando Excel desde JSON: {e}", exc_info=True)
-                    await update.message.reply_text(
-                        "⚠️ Se detectaron datos, pero ocurrió un error al generar el Excel."
-                    )
-                    return
-
-        if require_json:
-            await update.message.reply_text(
-                "⚠️ El asistente no devolvió una extracción válida en formato esperado."
-            )
-            return
-
-        if pref["voice_responses"] and len(response) < 3500:
-            voice_note_path = await self.text_to_speech(response, pref["voice_speed"])
-            if voice_note_path and os.path.exists(voice_note_path):
-                try:
-                    await context.bot.send_chat_action(
-                        chat_id=chat_id, action=ChatAction.RECORD_AUDIO
-                    )
-                    with open(voice_note_path, "rb") as audio:
-                        await update.message.reply_voice(audio)
-                    os.remove(voice_note_path)
-                    return
-                except Exception as e:
-                    logger.error(f"Error enviando voz: {e}", exc_info=True)
-
-        await update.message.reply_text(response)
-
-    async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        chat_id = update.message.chat.id
-        try:
-            user_message = (update.message.text or "").strip()
-            if not user_message:
-                return
-
-            response = await asyncio.wait_for(
-                self.process_text_message(update, context, user_message),
-                timeout=120.0,
-            )
-
-            if response is None or not response.strip():
-                raise ValueError("La respuesta del asistente está vacía")
-
-            await self.deliver_response(update, context, response, require_json=False)
-
-        except asyncio.TimeoutError:
-            logger.error(f"Timeout procesando mensaje de {chat_id}")
-            await update.message.reply_text(
-                "⏳ La operación está tomando demasiado tiempo. Inténtalo más tarde."
-            )
-        except openai.OpenAIError as e:
-            logger.error(f"Error OpenAI: {e}", exc_info=True)
-            await update.message.reply_text("❌ Hubo un problema con OpenAI.")
-        except Exception as e:
-            logger.error(f"Error inesperado en handle_message: {e}", exc_info=True)
-            await update.message.reply_text("⚠️ Ocurrió un error inesperado.")
 
     async def text_to_speech(self, text: str, speed: float = 1.0) -> Optional[str]:
         try:
@@ -880,13 +821,108 @@ class CoachBot:
             logger.error(f"Error en text_to_speech: {e}", exc_info=True)
             return None
 
+    async def deliver_text_response(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        response: str,
+    ):
+        chat_id = update.message.chat.id
+        pref = self.user_preferences.get(
+            chat_id, {"voice_responses": False, "voice_speed": 1.0}
+        )
+
+        if pref["voice_responses"] and len(response) < 3500:
+            voice_note_path = await self.text_to_speech(response, pref["voice_speed"])
+            if voice_note_path and os.path.exists(voice_note_path):
+                try:
+                    await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.RECORD_AUDIO)
+                    with open(voice_note_path, "rb") as audio:
+                        await update.message.reply_voice(audio)
+                    os.remove(voice_note_path)
+                    return
+                except Exception as e:
+                    logger.error(f"Error enviando voz: {e}", exc_info=True)
+
+        await update.message.reply_text(response)
+
+    async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        await update.message.reply_text(
+            "👋 Bienvenido. Envíame texto, voz o un PDF. "
+            "Los PDFs escaneados se procesan página por página como imagen y te entrego un Excel."
+        )
+
+    async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        help_text = (
+            "🤖 Comandos disponibles:\n\n"
+            "/start - Iniciar el bot\n"
+            "/help - Mostrar ayuda\n"
+            "/voz - Configurar respuestas por voz\n\n"
+            "Funcionalidades:\n"
+            "- Mensajes de texto\n"
+            "- Notas de voz\n"
+            "- PDFs escaneados o fotografiados\n"
+            "- Generación automática de Excel\n"
+        )
+        await update.message.reply_text(help_text)
+
+    async def voice_settings_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        chat_id = update.message.chat.id
+        pref = self.user_preferences.get(
+            chat_id, {"voice_responses": False, "voice_speed": 1.0}
+        )
+        voice_status = "activadas" if pref["voice_responses"] else "desactivadas"
+
+        help_text = (
+            "🎙 Configuración de voz\n\n"
+            f"Estado actual: respuestas de voz {voice_status}\n"
+            f"Velocidad actual: {pref['voice_speed']}x\n\n"
+            "Comandos:\n"
+            "- Activar voz\n"
+            "- Desactivar voz\n"
+            "- Velocidad 1.2\n"
+        )
+        await update.message.reply_text(help_text)
+
+    async def route_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        try:
+            await self.handle_message(update, context)
+        except Exception as e:
+            logger.error(f"Error en route_message: {e}", exc_info=True)
+            await update.message.reply_text("❌ Ocurrió un error procesando tu mensaje.")
+
+    async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        chat_id = update.message.chat.id
+        try:
+            user_message = (update.message.text or "").strip()
+            if not user_message:
+                return
+
+            response = await asyncio.wait_for(
+                self.process_text_message(update, context, user_message),
+                timeout=120.0,
+            )
+
+            if response is None or not response.strip():
+                raise ValueError("La respuesta del modelo está vacía")
+
+            await self.deliver_text_response(update, context, response)
+
+        except asyncio.TimeoutError:
+            logger.error(f"Timeout procesando mensaje de {chat_id}")
+            await update.message.reply_text("⏳ La operación está tomando demasiado tiempo. Inténtalo más tarde.")
+        except openai.OpenAIError as e:
+            logger.error(f"Error OpenAI: {e}", exc_info=True)
+            await update.message.reply_text("❌ Hubo un problema con OpenAI.")
+        except Exception as e:
+            logger.error(f"Error inesperado en handle_message: {e}", exc_info=True)
+            await update.message.reply_text("⚠️ Ocurrió un error inesperado.")
+
     def setup_handlers(self):
         self.telegram_app.add_handler(CommandHandler("start", self.start_command))
         self.telegram_app.add_handler(CommandHandler("help", self.help_command))
         self.telegram_app.add_handler(CommandHandler("voz", self.voice_settings_command))
-        self.telegram_app.add_handler(
-            MessageHandler(filters.TEXT & ~filters.COMMAND, self.route_message)
-        )
+        self.telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.route_message))
         self.telegram_app.add_handler(MessageHandler(filters.VOICE, self.handle_voice_message))
         self.telegram_app.add_handler(MessageHandler(filters.Document.PDF, self.handle_pdf))
         logger.info("Handlers configurados correctamente")
@@ -902,7 +938,6 @@ class CoachBot:
             try:
                 await self.telegram_app.bot.set_webhook(url=self.webhook_url)
                 webhook_info = await self.telegram_app.bot.get_webhook_info()
-
                 logger.info("Bot inicializado correctamente")
                 logger.info(f"Webhook configurado en: {self.webhook_url}")
                 logger.info(f"Webhook info: {webhook_info}")
