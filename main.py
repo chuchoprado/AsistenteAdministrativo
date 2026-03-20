@@ -22,6 +22,7 @@ from telegram.ext import (
 )
 
 from openai import AsyncOpenAI
+import openai
 import speech_recognition as sr
 from gtts import gTTS
 from pydub import AudioSegment
@@ -35,10 +36,6 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 app = FastAPI()
-
-
-def normalize_text(text: str) -> str:
-    return text.lower().strip()
 
 
 def convert_oga_to_wav(oga_path: str, wav_path: str) -> bool:
@@ -64,12 +61,6 @@ def strip_code_fences(text: str) -> str:
 
 
 def try_parse_json(text: str) -> Optional[Any]:
-    """
-    Intenta parsear JSON:
-    1. texto completo
-    2. bloque ```json ... ```
-    3. primer objeto/array JSON encontrado
-    """
     if not text or not text.strip():
         return None
 
@@ -121,10 +112,6 @@ def flatten_dict(d: Dict[str, Any], parent_key: str = "", sep: str = ".") -> Dic
 
 
 def json_to_rows(data: Any) -> Tuple[List[str], List[List[Any]], str]:
-    """
-    Convierte JSON a headers + rows para Excel.
-    Retorna: headers, rows, sheet_name
-    """
     if isinstance(data, list):
         if not data:
             return ["resultado"], [["Lista vacía"]], "Resultados"
@@ -138,7 +125,6 @@ def json_to_rows(data: Any) -> Tuple[List[str], List[List[Any]], str]:
         return ["valor"], [[json.dumps(item, ensure_ascii=False)] for item in data], "Resultados"
 
     if isinstance(data, dict):
-        # Caso ideal: { "rows": [...] } o { "data": [...] }
         for candidate_key in ("rows", "data", "items", "resultados", "registros"):
             if candidate_key in data and isinstance(data[candidate_key], list):
                 nested = data[candidate_key]
@@ -150,7 +136,10 @@ def json_to_rows(data: Any) -> Tuple[List[str], List[List[Any]], str]:
 
         flat = flatten_dict(data)
         headers = ["campo", "valor"]
-        rows = [[k, json.dumps(v, ensure_ascii=False) if isinstance(v, (dict, list)) else v] for k, v in flat.items()]
+        rows = [
+            [k, json.dumps(v, ensure_ascii=False) if isinstance(v, (dict, list)) else v]
+            for k, v in flat.items()
+        ]
         return headers, rows, "Resultado"
 
     return ["resultado"], [[str(data)]], "Resultado"
@@ -194,7 +183,9 @@ class CoachBot:
             "TELEGRAM_TOKEN": os.getenv("TELEGRAM_TOKEN"),
             "ASSISTANT_ID": os.getenv("ASSISTANT_ID"),
             "OPENAI_API_KEY": os.getenv("OPENAI_API_KEY"),
+            "WEBHOOK_URL": os.getenv("WEBHOOK_URL"),
         }
+
         missing_vars = [var for var, value in required_env_vars.items() if not value]
         if missing_vars:
             raise EnvironmentError(
@@ -203,6 +194,7 @@ class CoachBot:
 
         self.telegram_token = required_env_vars["TELEGRAM_TOKEN"]
         self.assistant_id = required_env_vars["ASSISTANT_ID"]
+        self.webhook_url = required_env_vars["WEBHOOK_URL"]
         self.client = AsyncOpenAI(api_key=required_env_vars["OPENAI_API_KEY"])
 
         self.started = False
@@ -334,7 +326,7 @@ class CoachBot:
             self.user_threads[chat_id] = thread.id
             return thread.id
         except Exception as e:
-            logger.error(f"Error creando thread para {chat_id}: {e}")
+            logger.error(f"Error creando thread para {chat_id}: {e}", exc_info=True)
             return None
 
     async def send_message_to_assistant(self, chat_id: int, user_message: str) -> str:
@@ -602,6 +594,9 @@ class CoachBot:
             await update.message.reply_text(
                 "⏳ La operación está tomando demasiado tiempo. Inténtalo más tarde."
             )
+        except openai.OpenAIError as e:
+            logger.error(f"Error OpenAI: {e}", exc_info=True)
+            await update.message.reply_text("❌ Hubo un problema con OpenAI.")
         except Exception as e:
             logger.error(f"Error inesperado en handle_message: {e}", exc_info=True)
             await update.message.reply_text("⚠️ Ocurrió un error inesperado.")
@@ -646,7 +641,13 @@ class CoachBot:
                 self.started = True
                 await self.telegram_app.start()
 
+            await self.telegram_app.bot.set_webhook(url=self.webhook_url)
+            webhook_info = await self.telegram_app.bot.get_webhook_info()
+
             logger.info("Bot inicializado correctamente")
+            logger.info(f"Webhook configurado en: {self.webhook_url}")
+            logger.info(f"Webhook info: {webhook_info}")
+
         except Exception as e:
             logger.error(f"Error en async_init: {e}", exc_info=True)
             raise
@@ -669,6 +670,16 @@ async def health():
     return {"status": "healthy"}
 
 
+@app.get("/webhook-info")
+async def webhook_info():
+    try:
+        info = await bot.telegram_app.bot.get_webhook_info()
+        return info.to_dict()
+    except Exception as e:
+        logger.error(f"Error obteniendo webhook_info: {e}", exc_info=True)
+        return {"status": "error", "message": str(e)}
+
+
 @app.on_event("startup")
 async def startup_event():
     try:
@@ -683,6 +694,7 @@ async def startup_event():
 async def webhook(request: Request):
     try:
         data = await request.json()
+        logger.info(f"Update recibido en webhook: {json.dumps(data)[:1000]}")
         update = Update.de_json(data, bot.telegram_app.bot)
         await bot.telegram_app.process_update(update)
         return {"status": "ok"}
