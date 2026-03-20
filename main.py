@@ -194,7 +194,19 @@ class CoachBot:
 
         self.telegram_token = required_env_vars["TELEGRAM_TOKEN"]
         self.assistant_id = required_env_vars["ASSISTANT_ID"]
-        self.webhook_url = required_env_vars["WEBHOOK_URL"]
+        self.webhook_url = required_env_vars["WEBHOOK_URL"].strip().strip('"').strip("'")
+
+        if self.webhook_url.startswith("WEBHOOK_URL="):
+            self.webhook_url = self.webhook_url.split("=", 1)[1].strip()
+
+        if not self.webhook_url.startswith("https://"):
+            raise EnvironmentError(f"WEBHOOK_URL inválida: {self.webhook_url}")
+
+        if "/webhook" not in self.webhook_url:
+            raise EnvironmentError(
+                f"WEBHOOK_URL debe apuntar a /webhook. Valor actual: {self.webhook_url}"
+            )
+
         self.client = AsyncOpenAI(api_key=required_env_vars["OPENAI_API_KEY"])
 
         self.started = False
@@ -329,6 +341,45 @@ class CoachBot:
             logger.error(f"Error creando thread para {chat_id}: {e}", exc_info=True)
             return None
 
+    async def wait_for_run_completion(self, thread_id: str, run_id: str, timeout: int = 120):
+        start_time = time.time()
+        while True:
+            run_status = await self.client.beta.threads.runs.retrieve(
+                thread_id=thread_id,
+                run_id=run_id,
+            )
+
+            if run_status.status == "completed":
+                return run_status
+
+            if run_status.status in {"failed", "cancelled", "expired"}:
+                raise RuntimeError(f"Run terminó con estado: {run_status.status}")
+
+            if run_status.status == "requires_action":
+                raise RuntimeError("El Assistant requiere una acción adicional no implementada.")
+
+            if time.time() - start_time > timeout:
+                raise TimeoutError("La consulta al asistente tardó demasiado.")
+
+            await asyncio.sleep(2)
+
+    async def get_latest_assistant_text(self, thread_id: str, limit: int = 10) -> Optional[str]:
+        messages = await self.client.beta.threads.messages.list(
+            thread_id=thread_id,
+            order="desc",
+            limit=limit,
+        )
+
+        for msg in messages.data:
+            if msg.role != "assistant" or not msg.content:
+                continue
+            for part in msg.content:
+                if getattr(part, "type", None) == "text":
+                    text_value = part.text.value.strip()
+                    if text_value:
+                        return text_value
+        return None
+
     async def send_message_to_assistant(self, chat_id: int, user_message: str) -> str:
         if chat_id in self.pending_requests:
             return "⏳ Ya estoy procesando tu solicitud anterior."
@@ -351,38 +402,13 @@ class CoachBot:
                 assistant_id=self.assistant_id,
             )
 
-            start_time = time.time()
-            while True:
-                run_status = await self.client.beta.threads.runs.retrieve(
-                    thread_id=thread_id,
-                    run_id=run.id,
-                )
+            await self.wait_for_run_completion(thread_id, run.id, timeout=120)
+            response = await self.get_latest_assistant_text(thread_id, limit=10)
 
-                if run_status.status == "completed":
-                    break
-                if run_status.status in {"failed", "cancelled", "expired"}:
-                    raise RuntimeError(f"Run terminó con estado: {run_status.status}")
-                if time.time() - start_time > 90:
-                    raise TimeoutError("La consulta al asistente tardó demasiado.")
+            if not response:
+                return "⚠️ La respuesta del asistente llegó vacía."
 
-                await asyncio.sleep(1)
-
-            messages = await self.client.beta.threads.messages.list(
-                thread_id=thread_id,
-                order="desc",
-                limit=10,
-            )
-
-            for msg in messages.data:
-                if msg.role != "assistant" or not msg.content:
-                    continue
-                for part in msg.content:
-                    if getattr(part, "type", None) == "text":
-                        text_value = part.text.value.strip()
-                        if text_value:
-                            return text_value
-
-            return "⚠️ La respuesta del asistente llegó vacía."
+            return response
 
         except Exception as e:
             logger.error(f"Error procesando mensaje con Assistant: {e}", exc_info=True)
@@ -424,6 +450,110 @@ class CoachBot:
                 logger.error(f"Error en process_text_message: {e}", exc_info=True)
                 return "⚠️ Ocurrió un error al procesar tu mensaje."
 
+    async def handle_pdf(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        pdf_path = None
+
+        try:
+            chat_id = update.message.chat.id
+            document = update.message.document
+
+            if not document:
+                await update.message.reply_text("⚠️ No recibí ningún documento.")
+                return
+
+            if document.mime_type != "application/pdf":
+                await update.message.reply_text("⚠️ Solo puedo procesar archivos PDF por ahora.")
+                return
+
+            lock = self.locks.setdefault(chat_id, asyncio.Lock())
+            async with lock:
+                if chat_id in self.pending_requests:
+                    await update.message.reply_text(
+                        "⏳ Ya estoy procesando una solicitud anterior. Espera un momento."
+                    )
+                    return
+
+                self.pending_requests.add(chat_id)
+                try:
+                    await context.bot.send_chat_action(
+                        chat_id=chat_id, action=ChatAction.UPLOAD_DOCUMENT
+                    )
+
+                    tg_file = await document.get_file()
+                    safe_name = document.file_name or f"archivo_{chat_id}.pdf"
+                    pdf_path = os.path.join(tempfile.gettempdir(), safe_name)
+
+                    await tg_file.download_to_drive(pdf_path)
+                    logger.info(f"PDF descargado: {pdf_path}")
+
+                    thread_id = await self.get_or_create_thread(chat_id)
+                    if not thread_id:
+                        await update.message.reply_text(
+                            "❌ No se pudo crear el thread del asistente."
+                        )
+                        return
+
+                    with open(pdf_path, "rb") as f:
+                        uploaded_file = await self.client.files.create(
+                            file=f,
+                            purpose="assistants",
+                        )
+
+                    logger.info(f"Archivo subido a OpenAI: {uploaded_file.id}")
+
+                    await update.message.reply_text("📄 PDF recibido. Lo estoy analizando...")
+
+                    user_prompt = (
+                        f"He subido un archivo PDF llamado '{safe_name}'. "
+                        "Analízalo y responde según su contenido. "
+                        "Si el usuario pide una tabla, resumen estructurado o datos exportables, "
+                        "devuelve JSON válido y limpio."
+                    )
+
+                    await self.client.beta.threads.messages.create(
+                        thread_id=thread_id,
+                        role="user",
+                        content=user_prompt,
+                        attachments=[
+                            {
+                                "file_id": uploaded_file.id,
+                                "tools": [{"type": "file_search"}],
+                            }
+                        ],
+                    )
+
+                    run = await self.client.beta.threads.runs.create(
+                        thread_id=thread_id,
+                        assistant_id=self.assistant_id,
+                    )
+
+                    await self.wait_for_run_completion(thread_id, run.id, timeout=180)
+                    assistant_message = await self.get_latest_assistant_text(thread_id, limit=10)
+
+                    if not assistant_message:
+                        await update.message.reply_text(
+                            "⚠️ El asistente no devolvió una respuesta."
+                        )
+                        return
+
+                    self.save_conversation(chat_id, "user", f"[PDF enviado] {safe_name}")
+                    self.save_conversation(chat_id, "assistant", assistant_message)
+
+                    await self.deliver_response(update, context, assistant_message)
+
+                finally:
+                    self.pending_requests.discard(chat_id)
+
+        except Exception as e:
+            logger.error(f"Error procesando PDF: {e}", exc_info=True)
+            await update.message.reply_text("⚠️ Ocurrió un error procesando el PDF.")
+        finally:
+            try:
+                if pdf_path and os.path.exists(pdf_path):
+                    os.remove(pdf_path)
+            except Exception as e:
+                logger.error(f"Error eliminando PDF temporal: {e}")
+
     async def handle_voice_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         oga_file_path = None
         wav_file_path = None
@@ -447,7 +577,7 @@ class CoachBot:
 
             try:
                 user_message = recognizer.recognize_google(audio, language="es-ES")
-                logger.info(f"Transcripción de voz: {user_message}")
+                logger.info(f'Transcripción de voz: "{user_message}"')
                 await update.message.reply_text(f'📝 Tu mensaje: "{user_message}"')
 
                 response = await self.process_text_message(update, context, user_message)
@@ -457,7 +587,9 @@ class CoachBot:
                 await update.message.reply_text("⚠️ No pude entender la nota de voz.")
             except sr.RequestError as e:
                 logger.error(f"Error en SpeechRecognition: {e}")
-                await update.message.reply_text("⚠️ Error en el servicio de reconocimiento de voz.")
+                await update.message.reply_text(
+                    "⚠️ Error en el servicio de reconocimiento de voz."
+                )
 
         except Exception as e:
             logger.error(f"Error manejando mensaje de voz: {e}", exc_info=True)
@@ -490,7 +622,8 @@ class CoachBot:
 
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
-            "👋 Bienvenido. Envíame tu solicitud y, si el asistente responde con JSON válido, te entregaré un Excel."
+            "👋 Bienvenido. Envíame texto, voz o un PDF. "
+            "Si el asistente devuelve JSON válido, te entregaré un Excel."
         )
 
     async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -499,9 +632,11 @@ class CoachBot:
             "/start - Iniciar el bot\n"
             "/help - Mostrar ayuda\n"
             "/voz - Configurar respuestas por voz\n\n"
-            "Funcionalidad principal:\n"
-            "- Si el asistente responde con JSON válido, genero y envío un archivo Excel.\n"
-            "- Si responde con texto normal, te lo entrego como texto o voz.\n"
+            "Funcionalidades:\n"
+            "- Mensajes de texto\n"
+            "- Notas de voz\n"
+            "- PDFs para analizar\n"
+            "- Generación de Excel cuando el asistente devuelva JSON válido\n"
         )
         await update.message.reply_text(help_text)
 
@@ -581,7 +716,7 @@ class CoachBot:
 
             response = await asyncio.wait_for(
                 self.process_text_message(update, context, user_message),
-                timeout=90.0,
+                timeout=120.0,
             )
 
             if response is None or not response.strip():
@@ -631,6 +766,7 @@ class CoachBot:
             MessageHandler(filters.TEXT & ~filters.COMMAND, self.route_message)
         )
         self.telegram_app.add_handler(MessageHandler(filters.VOICE, self.handle_voice_message))
+        self.telegram_app.add_handler(MessageHandler(filters.Document.PDF, self.handle_pdf))
         logger.info("Handlers configurados correctamente")
 
     async def async_init(self):
@@ -641,12 +777,15 @@ class CoachBot:
                 self.started = True
                 await self.telegram_app.start()
 
-            await self.telegram_app.bot.set_webhook(url=self.webhook_url)
-            webhook_info = await self.telegram_app.bot.get_webhook_info()
+            try:
+                await self.telegram_app.bot.set_webhook(url=self.webhook_url)
+                webhook_info = await self.telegram_app.bot.get_webhook_info()
 
-            logger.info("Bot inicializado correctamente")
-            logger.info(f"Webhook configurado en: {self.webhook_url}")
-            logger.info(f"Webhook info: {webhook_info}")
+                logger.info("Bot inicializado correctamente")
+                logger.info(f"Webhook configurado en: {self.webhook_url}")
+                logger.info(f"Webhook info: {webhook_info}")
+            except Exception as e:
+                logger.error(f"No se pudo configurar el webhook: {e}", exc_info=True)
 
         except Exception as e:
             logger.error(f"Error en async_init: {e}", exc_info=True)
