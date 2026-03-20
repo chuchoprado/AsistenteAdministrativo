@@ -35,7 +35,7 @@ from openpyxl.utils import get_column_letter
 
 
 logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
@@ -71,10 +71,8 @@ def safe_float(value: Any) -> Optional[float]:
     text = text.replace("€", "").replace("EUR", "").replace("Gs.", "").replace("$", "").strip()
     text = text.replace(" ", "")
 
-    # Caso 1.234,56
     if text.count(".") >= 1 and text.count(",") == 1:
         text = text.replace(".", "").replace(",", ".")
-    # Caso 1234,56
     elif text.count(",") == 1 and text.count(".") == 0:
         text = text.replace(",", ".")
 
@@ -619,13 +617,17 @@ class CoachBot:
                 "iva_pct": {"type": ["number", "null"]},
                 "base_eur": {"type": ["number", "null"]},
                 "cuota_eur": {"type": ["number", "null"]},
-                "estado": {"type": ["string", "null"]},
+                "estado": {
+                    "type": ["string", "null"],
+                    "enum": ["COMPLETA", "VERIFICAR_DATOS", "PENDIENTE_REVISION", None],
+                },
                 "observaciones": {"type": ["string", "null"]},
                 "status": {"type": ["string", "null"]},
                 "total": {"type": ["number", "string", "null"]},
                 "importe_total": {"type": ["number", "string", "null"]},
                 "monto_total": {"type": ["number", "string", "null"]},
                 "fecha": {"type": ["string", "null"]},
+                "obs": {"type": ["string", "null"]},
             },
             "required": [
                 "numero_factura",
@@ -706,7 +708,6 @@ class CoachBot:
             parsed["pagina"] = page_num
             normalized = normalize_row(parsed, page_num)
 
-            # si vino todo vacío, lo forzamos a pendiente
             if (
                 normalized["fecha_iso"] is None
                 and normalized["total_eur"] is None
