@@ -7,6 +7,7 @@ gTTS>=2.5,<3
 pydub>=0.25,<1
 ffmpeg-python>=0.2.0,<1
 openpyxl>=3.1,<4
+PyMuPDF>=1.24,<2
 httpx>=0.28,<1
 pydantic>=2.12,<3
 gunicorn>=23,<24
