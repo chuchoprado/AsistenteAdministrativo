@@ -111,38 +111,126 @@ def flatten_dict(d: Dict[str, Any], parent_key: str = "", sep: str = ".") -> Dic
     return items
 
 
-def json_to_rows(data: Any) -> Tuple[List[str], List[List[Any]], str]:
-    if isinstance(data, list):
-        if not data:
-            return ["resultado"], [["Lista vacía"]], "Resultados"
+def is_probably_schema_definition(data: Any) -> bool:
+    """
+    Detecta respuestas JSON que son schema/plantilla y no datos reales.
+    """
+    if not isinstance(data, dict):
+        return False
 
-        if all(isinstance(item, dict) for item in data):
-            flattened = [flatten_dict(item) for item in data]
-            headers = sorted({key for row in flattened for key in row.keys()})
-            rows = [[row.get(h, "") for h in headers] for row in flattened]
-            return headers, rows, "Resultados"
+    schema_keys = {"type", "properties", "schema", "required", "additionalProperties", "items"}
+    data_keys = set(data.keys())
 
-        return ["valor"], [[json.dumps(item, ensure_ascii=False)] for item in data], "Resultados"
+    if data_keys and data_keys.issubset(schema_keys):
+        return True
 
-    if isinstance(data, dict):
-        for candidate_key in ("rows", "data", "items", "resultados", "registros"):
-            if candidate_key in data and isinstance(data[candidate_key], list):
-                nested = data[candidate_key]
-                if nested and all(isinstance(item, dict) for item in nested):
-                    flattened = [flatten_dict(item) for item in nested]
-                    headers = sorted({key for row in flattened for key in row.keys()})
-                    rows = [[row.get(h, "") for h in headers] for row in flattened]
-                    return headers, rows, "Resultados"
+    if "type" in data and "properties" in data:
+        return True
 
-        flat = flatten_dict(data)
-        headers = ["campo", "valor"]
-        rows = [
-            [k, json.dumps(v, ensure_ascii=False) if isinstance(v, (dict, list)) else v]
-            for k, v in flat.items()
+    return False
+
+
+def is_valid_extraction_payload(data: Any) -> bool:
+    """
+    Acepta solo payloads del tipo:
+    {
+      "rows": [ {...}, {...} ]
+    }
+    """
+    if not isinstance(data, dict):
+        return False
+
+    if is_probably_schema_definition(data):
+        return False
+
+    if "rows" not in data:
+        return False
+
+    rows = data.get("rows")
+    if not isinstance(rows, list):
+        return False
+
+    if len(rows) == 0:
+        return False
+
+    allowed_keys = {
+        "numero_factura",
+        "pagina",
+        "fecha_literal",
+        "fecha_iso",
+        "total_eur",
+        "iva_pct",
+        "base_eur",
+        "cuota_eur",
+        "estado",
+        "observaciones",
+    }
+
+    real_row_found = False
+
+    for row in rows:
+        if not isinstance(row, dict):
+            return False
+
+        if not row:
+            continue
+
+        row_keys = set(row.keys())
+        if not row_keys.issubset(allowed_keys):
+            # Si trae campos raros tipo type/properties, no sirve
+            if row_keys & {"type", "properties", "schema", "items"}:
+                return False
+
+        # Consideramos "real" si trae al menos alguno de los campos esperados con valor útil
+        useful_keys = [
+            "pagina",
+            "fecha_literal",
+            "fecha_iso",
+            "total_eur",
+            "estado",
+            "observaciones",
         ]
-        return headers, rows, "Resultado"
+        for key in useful_keys:
+            if key in row and row[key] not in (None, "", [], {}):
+                real_row_found = True
+                break
 
-    return ["resultado"], [[str(data)]], "Resultado"
+    return real_row_found
+
+
+def json_to_rows(data: Any) -> Tuple[List[str], List[List[Any]], str]:
+    """
+    Convierte SOLO payload válido de extracción a Excel.
+    """
+    if isinstance(data, dict) and isinstance(data.get("rows"), list):
+        rows_data = data["rows"]
+
+        headers = [
+            "numero_factura",
+            "pagina",
+            "fecha_literal",
+            "fecha_iso",
+            "total_eur",
+            "iva_pct",
+            "base_eur",
+            "cuota_eur",
+            "estado",
+            "observaciones",
+        ]
+
+        rows = []
+        for item in rows_data:
+            row = []
+            for h in headers:
+                value = item.get(h, "")
+                if value is None:
+                    value = ""
+                row.append(value)
+            rows.append(row)
+
+        return headers, rows, "Facturas"
+
+    raise ValueError("Payload JSON no válido para extracción contable.")
 
 
 def autosize_worksheet(ws) -> None:
@@ -505,12 +593,13 @@ class CoachBot:
 
                     user_prompt = (
                         f"Lee y extrae la información del PDF '{safe_name}'. "
-                        "NO respondas con explicaciones, disculpas, comentarios ni texto adicional. "
-                        "NO digas que no pudiste extraer la información. "
-                        "Debes devolver ÚNICAMENTE JSON válido, limpio y parseable. "
-                        "Si el documento contiene una tabla o registros, devuelve una lista de objetos JSON. "
-                        "Si el documento contiene campos sueltos, devuelve un objeto JSON con claves y valores. "
-                        "No uses markdown. No uses ```json. No agregues texto antes ni después del JSON."
+                        "Devuelve únicamente datos reales extraídos del documento. "
+                        "No describas el esquema. "
+                        "No devuelvas type, properties, schema, required, items ni plantillas vacías. "
+                        "No devuelvas ejemplos. "
+                        "No devuelvas texto fuera de la estructura. "
+                        "Debes devolver únicamente un objeto con la clave rows, conteniendo un array de registros reales extraídos del PDF. "
+                        "Nunca inventes datos. Si no puedes determinar un valor con seguridad razonable, usa null."
                     )
 
                     await self.client.beta.threads.messages.create(
@@ -529,9 +618,14 @@ class CoachBot:
                         thread_id=thread_id,
                         assistant_id=self.assistant_id,
                         instructions=(
-                            "Tu única tarea es extraer la data del archivo y devolver SOLO JSON válido. "
-                            "Nunca respondas con texto conversacional, disculpas, advertencias ni explicaciones. "
-                            "La salida será convertida automáticamente a Excel, así que responde únicamente con JSON."
+                            "Tu única tarea es extraer data real del PDF y devolver únicamente un objeto JSON con la clave rows. "
+                            "No devuelvas el schema. "
+                            "No devuelvas plantillas vacías. "
+                            "No devuelvas definiciones de formato. "
+                            "No respondas con type, properties, schema, items ni estructuras de ejemplo. "
+                            "Debes devolver datos reales del documento. "
+                            "Si no puedes extraer un valor, usa null. "
+                            "Si una página no es procesable, incluye igualmente un registro real con estado PENDIENTE_REVISION."
                         ),
                     )
 
@@ -547,7 +641,12 @@ class CoachBot:
                     self.save_conversation(chat_id, "user", f"[PDF enviado] {safe_name}")
                     self.save_conversation(chat_id, "assistant", assistant_message)
 
-                    await self.deliver_response(update, context, assistant_message, require_json=True)
+                    await self.deliver_response(
+                        update,
+                        context,
+                        assistant_message,
+                        require_json=True,
+                    )
 
                 finally:
                     self.pending_requests.discard(chat_id)
@@ -631,7 +730,7 @@ class CoachBot:
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "👋 Bienvenido. Envíame texto, voz o un PDF. "
-            "Si el asistente devuelve JSON válido, te entregaré un Excel."
+            "Si el asistente devuelve datos estructurados válidos, te entregaré un Excel."
         )
 
     async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -644,7 +743,7 @@ class CoachBot:
             "- Mensajes de texto\n"
             "- Notas de voz\n"
             "- PDFs para analizar\n"
-            "- Generación de Excel cuando el asistente devuelva JSON válido\n"
+            "- Generación de Excel cuando el asistente devuelva rows válidos\n"
         )
         await update.message.reply_text(help_text)
 
@@ -668,41 +767,49 @@ class CoachBot:
         )
 
         parsed_json = try_parse_json(response)
+
         if parsed_json is not None:
-            try:
-                excel_path = create_excel_from_json(parsed_json)
+            if not is_valid_extraction_payload(parsed_json):
+                logger.warning(f"JSON recibido pero no válido para extracción: {parsed_json}")
 
-                await update.message.reply_text(
-                    "📊 JSON detectado. Generando Excel..."
-                )
-
-                with open(excel_path, "rb") as f:
-                    await update.message.reply_document(
-                        document=f,
-                        filename=os.path.basename(excel_path),
-                        caption="Aquí tienes el archivo Excel generado desde la extracción.",
+                if require_json:
+                    await update.message.reply_text(
+                        "⚠️ El asistente devolvió JSON, pero no contiene datos de extracción válidos."
                     )
-
+                    return
+            else:
                 try:
-                    os.remove(excel_path)
-                    parent_dir = os.path.dirname(excel_path)
-                    if os.path.isdir(parent_dir):
-                        os.rmdir(parent_dir)
-                except Exception:
-                    pass
+                    excel_path = create_excel_from_json(parsed_json)
 
-                return
+                    await update.message.reply_text("📊 Datos válidos detectados. Generando Excel...")
 
-            except Exception as e:
-                logger.error(f"Error generando Excel desde JSON: {e}", exc_info=True)
-                await update.message.reply_text(
-                    "⚠️ Se detectó JSON, pero ocurrió un error al generar el Excel."
-                )
-                return
+                    with open(excel_path, "rb") as f:
+                        await update.message.reply_document(
+                            document=f,
+                            filename=os.path.basename(excel_path),
+                            caption="Aquí tienes el archivo Excel generado desde la extracción.",
+                        )
+
+                    try:
+                        os.remove(excel_path)
+                        parent_dir = os.path.dirname(excel_path)
+                        if os.path.isdir(parent_dir):
+                            os.rmdir(parent_dir)
+                    except Exception:
+                        pass
+
+                    return
+
+                except Exception as e:
+                    logger.error(f"Error generando Excel desde JSON: {e}", exc_info=True)
+                    await update.message.reply_text(
+                        "⚠️ Se detectaron datos, pero ocurrió un error al generar el Excel."
+                    )
+                    return
 
         if require_json:
             await update.message.reply_text(
-                "⚠️ El asistente no devolvió JSON válido desde el PDF. Revisa que el Assistant tenga habilitado file_search y que sus instrucciones estén orientadas a extracción estructurada."
+                "⚠️ El asistente no devolvió una extracción válida en formato esperado."
             )
             return
 
