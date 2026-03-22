@@ -393,6 +393,12 @@ class CoachBot:
 
         self.started = False
         self.pending_requests = set()
+        self.processing_documents = set()
+        self.processed_document_ids: Dict[str, float] = {}
+        self.processed_update_ids: Dict[int, float] = {}
+        self.update_lock = asyncio.Lock()
+        self.document_lock = asyncio.Lock()
+
         self.db_path = "bot_data.db"
         self.user_preferences: Dict[int, Dict[str, Any]] = {}
         self.locks: Dict[int, asyncio.Lock] = {}
@@ -402,6 +408,47 @@ class CoachBot:
         self._init_db()
         self._load_user_preferences()
         self.setup_handlers()
+
+    def _prune_processed_ids(self):
+        now = time.time()
+        ttl_updates = 3600
+        ttl_documents = 7200
+
+        self.processed_update_ids = {
+            k: v for k, v in self.processed_update_ids.items() if now - v < ttl_updates
+        }
+        self.processed_document_ids = {
+            k: v for k, v in self.processed_document_ids.items() if now - v < ttl_documents
+        }
+
+    async def is_duplicate_update(self, update_id: int) -> bool:
+        async with self.update_lock:
+            self._prune_processed_ids()
+            if update_id in self.processed_update_ids:
+                return True
+            self.processed_update_ids[update_id] = time.time()
+            return False
+
+    async def start_document_processing(self, document_key: str) -> bool:
+        async with self.document_lock:
+            self._prune_processed_ids()
+            if document_key in self.processing_documents:
+                return False
+            if document_key in self.processed_document_ids:
+                return False
+            self.processing_documents.add(document_key)
+            return True
+
+    async def finish_document_processing(self, document_key: str):
+        async with self.document_lock:
+            if document_key in self.processing_documents:
+                self.processing_documents.remove(document_key)
+            self.processed_document_ids[document_key] = time.time()
+
+    async def abort_document_processing(self, document_key: str):
+        async with self.document_lock:
+            if document_key in self.processing_documents:
+                self.processing_documents.remove(document_key)
 
     def _init_db(self):
         with closing(sqlite3.connect(self.db_path)) as conn:
@@ -703,25 +750,29 @@ class CoachBot:
 
     async def handle_pdf(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         pdf_path = None
+        document_key = None
 
         try:
+            if not update.message or not update.message.document:
+                return
+
             chat_id = update.message.chat.id
             document = update.message.document
-
-            if not document:
-                await update.message.reply_text("⚠️ No recibí ningún documento.")
-                return
 
             if document.mime_type != "application/pdf":
                 await update.message.reply_text("⚠️ Solo puedo procesar archivos PDF por ahora.")
                 return
 
+            document_key = document.file_unique_id or document.file_id
+
+            if not await self.start_document_processing(document_key):
+                logger.info(f"Documento duplicado ignorado: {document_key}")
+                return
+
             lock = self.locks.setdefault(chat_id, asyncio.Lock())
             async with lock:
                 if chat_id in self.pending_requests:
-                    await update.message.reply_text(
-                        "⏳ Ya estoy procesando una solicitud anterior. Espera un momento."
-                    )
+                    logger.info(f"Solicitud ya en proceso para chat {chat_id}, documento {document_key}")
                     return
 
                 self.pending_requests.add(chat_id)
@@ -780,12 +831,17 @@ class CoachBot:
                     except Exception:
                         pass
 
+                    await self.finish_document_processing(document_key)
+
                 finally:
                     self.pending_requests.discard(chat_id)
 
         except Exception as e:
             logger.error(f"Error procesando PDF: {e}", exc_info=True)
-            await update.message.reply_text("⚠️ Ocurrió un error procesando el PDF.")
+            if update.message:
+                await update.message.reply_text("⚠️ Ocurrió un error procesando el PDF.")
+            if document_key:
+                await self.abort_document_processing(document_key)
         finally:
             try:
                 if pdf_path and os.path.exists(pdf_path):
@@ -996,6 +1052,13 @@ except Exception as e:
     raise
 
 
+async def process_update_background(update: Update):
+    try:
+        await bot.telegram_app.process_update(update)
+    except Exception as e:
+        logger.error(f"Error en procesamiento background del update: {e}", exc_info=True)
+
+
 @app.get("/")
 async def root():
     return {"status": "ok", "message": "Bot activo en Render"}
@@ -1030,10 +1093,20 @@ async def startup_event():
 async def webhook(request: Request):
     try:
         data = await request.json()
-        logger.info(f"Update recibido en webhook: {json.dumps(data)[:1000]}")
         update = Update.de_json(data, bot.telegram_app.bot)
-        await bot.telegram_app.process_update(update)
+
+        update_id = getattr(update, "update_id", None)
+        if update_id is not None:
+            is_dup = await bot.is_duplicate_update(update_id)
+            if is_dup:
+                logger.info(f"Update duplicado ignorado: {update_id}")
+                return {"status": "ok", "duplicate": True}
+
+        logger.info(f"Update recibido en webhook: {json.dumps(data)[:1000]}")
+
+        asyncio.create_task(process_update_background(update))
         return {"status": "ok"}
+
     except Exception as e:
         logger.error(f"Error procesando webhook: {e}", exc_info=True)
         return {"status": "error", "message": str(e)}
